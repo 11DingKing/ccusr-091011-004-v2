@@ -128,6 +128,9 @@ class OperationLogMiddleware:
             '/api/stock-out-persons/': '出库人员管理',
             '/api/approvals/': '审批管理',
             '/api/warnings/': '预警管理',
+            '/api/freezes/': '法律冻结管理',
+            '/api/transfers/': '转移管理',
+            '/api/disposals/': '销毁管理',
         }
         
         for prefix, name in module_map.items():

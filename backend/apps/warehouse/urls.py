@@ -8,44 +8,66 @@ from .views import (
     VarietyListView, VarietyDetailView, VarietyBatchDeleteView,
     VarietyTemplateView, VarietyImportView,
     DashboardView, GoodsListView, StockInListView, StockOutListView,
-    WarningListView, ApprovalListView
+    StockOutReviewView, StockOutCompleteView,
+    TransferListCreateView, TransferReviewView, TransferCompleteView,
+    DisposalListCreateView, DisposalReviewView, DisposalDestroyView,
+    WarningListView, ApprovalListView,
+    FreezeListCreateView, FreezeDetailView, FreezeLiftView, GoodsFreezeStatusView,
 )
 
 urlpatterns = [
     # 仪表盘
     path('dashboard/', DashboardView.as_view(), name='dashboard'),
-    
+
     # 单位管理
     path('units/', UnitListView.as_view(), name='unit-list'),
     path('units/all/', UnitAllView.as_view(), name='unit-all'),
     path('units/batch-delete/', UnitBatchDeleteView.as_view(), name='unit-batch-delete'),
     path('units/<int:pk>/', UnitDetailView.as_view(), name='unit-detail'),
-    
+
     # 品类管理
     path('categories/', CategoryListView.as_view(), name='category-list'),
     path('categories/all/', CategoryAllView.as_view(), name='category-all'),
     path('categories/batch-delete/', CategoryBatchDeleteView.as_view(), name='category-batch-delete'),
     path('categories/<int:pk>/', CategoryDetailView.as_view(), name='category-detail'),
-    
+
     # 品种管理
     path('varieties/', VarietyListView.as_view(), name='variety-list'),
     path('varieties/batch-delete/', VarietyBatchDeleteView.as_view(), name='variety-batch-delete'),
     path('varieties/template/', VarietyTemplateView.as_view(), name='variety-template'),
     path('varieties/import/', VarietyImportView.as_view(), name='variety-import'),
     path('varieties/<int:pk>/', VarietyDetailView.as_view(), name='variety-detail'),
-    
+
     # 货物管理
     path('goods/', GoodsListView.as_view(), name='goods-list'),
-    
+    path('goods/<int:pk>/freeze-status/', GoodsFreezeStatusView.as_view(), name='goods-freeze-status'),
+
     # 入库管理
     path('stock-in/', StockInListView.as_view(), name='stock-in-list'),
-    
-    # 出库管理
+
+    # 出库管理（申请 / 审批 / 执行）
     path('stock-out/', StockOutListView.as_view(), name='stock-out-list'),
-    
+    path('stock-out/<int:pk>/review/', StockOutReviewView.as_view(), name='stock-out-review'),
+    path('stock-out/<int:pk>/complete/', StockOutCompleteView.as_view(), name='stock-out-complete'),
+
+    # 转移管理（申请 / 审批 / 执行）
+    path('transfers/', TransferListCreateView.as_view(), name='transfer-list'),
+    path('transfers/<int:pk>/review/', TransferReviewView.as_view(), name='transfer-review'),
+    path('transfers/<int:pk>/complete/', TransferCompleteView.as_view(), name='transfer-complete'),
+
+    # 销毁管理（计划 / 审批 / 执行）
+    path('disposals/', DisposalListCreateView.as_view(), name='disposal-list'),
+    path('disposals/<int:pk>/review/', DisposalReviewView.as_view(), name='disposal-review'),
+    path('disposals/<int:pk>/destroy/', DisposalDestroyView.as_view(), name='disposal-destroy'),
+
     # 预警管理
     path('warnings/', WarningListView.as_view(), name='warning-list'),
-    
+
     # 审批管理
     path('approvals/', ApprovalListView.as_view(), name='approval-list'),
+
+    # 法律冻结
+    path('freezes/', FreezeListCreateView.as_view(), name='freeze-list'),
+    path('freezes/<int:pk>/', FreezeDetailView.as_view(), name='freeze-detail'),
+    path('freezes/<int:pk>/lift/', FreezeLiftView.as_view(), name='freeze-lift'),
 ]

@@ -3,6 +3,7 @@
 """
 import logging
 import io
+from decimal import Decimal, InvalidOperation
 from django.http import HttpResponse
 from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated
@@ -10,14 +11,24 @@ from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from apps.core.response import success_response, error_response
-from .models import Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval
+from .models import (
+    Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval,
+    TransferOrder, DisposalPlan, LegalFreeze, FreezeItem, FreezeEvent,
+    get_blocking_items,
+)
 from .serializers import (
     UnitSerializer, UnitCreateSerializer,
     CategorySerializer, CategoryCreateSerializer,
     VarietySerializer, VarietyCreateSerializer,
     GoodsSerializer, StockInSerializer, StockOutSerializer,
-    WarningSerializer, ApprovalSerializer
+    WarningSerializer, ApprovalSerializer,
+    TransferOrderSerializer, DisposalPlanSerializer,
+    LegalFreezeSerializer, FreezeEventSerializer,
+    LegalFreezeCreateSerializer, LegalFreezeLiftSerializer,
 )
+from . import services
+from .services import OPERATION_LABELS, OP_STOCK_OUT, OP_TRANSFER, OP_DESTROY
+from apps.core.exceptions import BusinessException
 
 logger = logging.getLogger('apps')
 
@@ -573,66 +584,536 @@ class DashboardView(APIView):
         })
 
 
+# ==================== 货物 / 入库 / 预警 / 审批查询 ====================
+
 class GoodsListView(APIView):
-    """货物列表视图"""
+    """货物列表视图（含当前冻结阻断依据）"""
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request):
+        queryset = Goods.objects.select_related(
+            'variety__category__unit'
+        ).filter(is_active=True).order_by('-created_at')
+
+        page = max(int(request.query_params.get('page', 1)), 1)
+        page_size = max(int(request.query_params.get('page_size', 10)), 1)
+        start = (page - 1) * page_size
+        end = start + page_size
+
+        total = queryset.count()
+        goods_list = list(queryset[start:end])
+
+        # 当前阻断依据：任一生效冻结限制任一受控操作即视为被冻结
+        blockers = {}
+        for op in (OP_STOCK_OUT, OP_TRANSFER, OP_DESTROY):
+            for goods_id, items in get_blocking_items(
+                [g.pk for g in goods_list], op
+            ).items():
+                blockers.setdefault(goods_id, []).extend(items)
+
+        data = GoodsSerializer(goods_list, many=True).data
+        for row, goods in zip(data, goods_list):
+            items = blockers.get(goods.pk, [])
+            row['is_frozen'] = bool(items)
+            # 同一冻结可能限制多个操作，按冻结编号去重展示
+            seen, basis = set(), []
+            for item in items:
+                if item.freeze_id in seen:
+                    continue
+                seen.add(item.freeze_id)
+                basis.append({
+                    'freeze_id': item.freeze_id,
+                    'freeze_no': item.freeze.freeze_no,
+                    'case_info': item.freeze.case_info,
+                    'authority': item.freeze.authority,
+                    'legal_doc': item.freeze.legal_doc,
+                    'effective_from': item.freeze.effective_from,
+                })
+            row['freeze_basis'] = basis
+
         return success_response(data={
-            'list': [],
-            'total': 0,
-            'page': 1,
-            'page_size': 10
+            'list': data, 'total': total, 'page': page, 'page_size': page_size
         })
 
 
 class StockInListView(APIView):
     """入库记录列表视图"""
     permission_classes = [IsAuthenticated]
-    
-    def get(self, request):
-        return success_response(data={
-            'list': [],
-            'total': 0,
-            'page': 1,
-            'page_size': 10
-        })
 
-
-class StockOutListView(APIView):
-    """出库记录列表视图"""
-    permission_classes = [IsAuthenticated]
-    
     def get(self, request):
+        queryset = StockIn.objects.select_related('goods', 'operator').order_by('-stock_in_time')
+        page = max(int(request.query_params.get('page', 1)), 1)
+        page_size = max(int(request.query_params.get('page_size', 10)), 1)
+        total = queryset.count()
+        records = queryset[(page - 1) * page_size: (page - 1) * page_size + page_size]
         return success_response(data={
-            'list': [],
-            'total': 0,
-            'page': 1,
-            'page_size': 10
+            'list': StockInSerializer(records, many=True).data,
+            'total': total, 'page': page, 'page_size': page_size
         })
 
 
 class WarningListView(APIView):
     """预警记录列表视图"""
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request):
+        queryset = Warning.objects.select_related('goods').order_by('-created_at')
+        page = max(int(request.query_params.get('page', 1)), 1)
+        page_size = max(int(request.query_params.get('page_size', 10)), 1)
+        total = queryset.count()
+        records = queryset[(page - 1) * page_size: (page - 1) * page_size + page_size]
         return success_response(data={
-            'list': [],
-            'total': 0,
-            'page': 1,
-            'page_size': 10
+            'list': WarningSerializer(records, many=True).data,
+            'total': total, 'page': page, 'page_size': page_size
         })
 
 
 class ApprovalListView(APIView):
     """审批记录列表视图"""
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request):
+        queryset = Approval.objects.select_related(
+            'stock_out__goods', 'approver'
+        ).order_by('-created_at')
+        page = max(int(request.query_params.get('page', 1)), 1)
+        page_size = max(int(request.query_params.get('page_size', 10)), 1)
+        total = queryset.count()
+        records = queryset[(page - 1) * page_size: (page - 1) * page_size + page_size]
         return success_response(data={
-            'list': [],
-            'total': 0,
-            'page': 1,
-            'page_size': 10
+            'list': ApprovalSerializer(records, many=True).data,
+            'total': total, 'page': page, 'page_size': page_size
+        })
+
+
+# ==================== 出库（领用）流程 ====================
+
+class StockOutListView(APIView):
+    """出库申请列表 / 提交领用申请"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        queryset = StockOut.objects.select_related('goods', 'operator').order_by('-created_at')
+        status = request.query_params.get('status')
+        if status:
+            queryset = queryset.filter(status=status)
+        page = max(int(request.query_params.get('page', 1)), 1)
+        page_size = max(int(request.query_params.get('page_size', 10)), 1)
+        total = queryset.count()
+        records = queryset[(page - 1) * page_size: (page - 1) * page_size + page_size]
+        return success_response(data={
+            'list': StockOutSerializer(records, many=True).data,
+            'total': total, 'page': page, 'page_size': page_size
+        })
+
+    def post(self, request):
+        goods_id = request.data.get('goods')
+        try:
+            goods = Goods.objects.get(pk=goods_id)
+        except (TypeError, ValueError, Goods.DoesNotExist):
+            return error_response(message='物资不存在', code=404)
+
+        receiver = (request.data.get('receiver') or '').strip()
+        if not receiver:
+            return error_response(message='请填写领用人')
+        try:
+            quantity = Decimal(request.data.get('quantity'))
+        except (TypeError, ValueError, InvalidOperation):
+            return error_response(message='出库数量格式错误')
+
+        try:
+            stock_out = services.create_stock_out(
+                user=request.user, goods=goods, quantity=quantity,
+                receiver=receiver,
+                receiver_dept=request.data.get('receiver_dept', ''),
+                remark=request.data.get('remark', ''),
+            )
+        except BusinessException as exc:
+            return error_response(message=exc.message, code=exc.code)
+
+        logger.info("User %s submitted stock out %s", request.user.username, stock_out.id)
+        return success_response(data=StockOutSerializer(stock_out).data, message='申请已提交')
+
+
+class StockOutReviewView(APIView):
+    """出库审批（放行点：审批通过前持锁复查冻结）"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        approved = bool(request.data.get('approved'))
+        remark = request.data.get('remark', '')
+        try:
+            stock_out, _ = services.review_stock_out(
+                pk, approver=request.user, approved=approved, remark=remark
+            )
+        except BusinessException as exc:
+            return error_response(message=exc.message, code=exc.code)
+        action = '通过' if approved else '拒绝'
+        logger.info("User %s %s stock out %s", request.user.username, action, pk)
+        return success_response(data=StockOutSerializer(stock_out).data, message=f'已{action}')
+
+
+class StockOutCompleteView(APIView):
+    """执行出库（放行点：扣减库存前再次持锁复查冻结）"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        try:
+            stock_out = services.complete_stock_out(pk, user=request.user)
+        except BusinessException as exc:
+            return error_response(message=exc.message, code=exc.code)
+        logger.info("User %s completed stock out %s", request.user.username, pk)
+        return success_response(data=StockOutSerializer(stock_out).data, message='出库完成')
+
+
+# ==================== 转移流程 ====================
+
+class TransferListCreateView(APIView):
+    """转移记录列表 / 提交转移申请"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        queryset = TransferOrder.objects.select_related('goods', 'operator').order_by('-created_at')
+        status = request.query_params.get('status')
+        if status:
+            queryset = queryset.filter(status=status)
+        page = max(int(request.query_params.get('page', 1)), 1)
+        page_size = max(int(request.query_params.get('page_size', 10)), 1)
+        total = queryset.count()
+        records = queryset[(page - 1) * page_size: (page - 1) * page_size + page_size]
+        return success_response(data={
+            'list': TransferOrderSerializer(records, many=True).data,
+            'total': total, 'page': page, 'page_size': page_size
+        })
+
+    def post(self, request):
+        try:
+            goods = Goods.objects.get(pk=request.data.get('goods'))
+        except (TypeError, ValueError, Goods.DoesNotExist):
+            return error_response(message='物资不存在', code=404)
+        target_location = (request.data.get('target_location') or '').strip()
+        if not target_location:
+            return error_response(message='请填写目标存放位置')
+        try:
+            quantity = Decimal(request.data.get('quantity'))
+        except (TypeError, ValueError, InvalidOperation):
+            return error_response(message='转移数量格式错误')
+        try:
+            order = services.create_transfer(
+                user=request.user, goods=goods, quantity=quantity,
+                target_location=target_location,
+                target_keeper=request.data.get('target_keeper', ''),
+                remark=request.data.get('remark', ''),
+            )
+        except BusinessException as exc:
+            return error_response(message=exc.message, code=exc.code)
+        return success_response(data=TransferOrderSerializer(order).data, message='申请已提交')
+
+
+class TransferReviewView(APIView):
+    """转移审批"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        try:
+            order = services.review_transfer(
+                pk, approver=request.user,
+                approved=bool(request.data.get('approved')),
+                remark=request.data.get('remark', ''),
+            )
+        except BusinessException as exc:
+            return error_response(message=exc.message, code=exc.code)
+        return success_response(data=TransferOrderSerializer(order).data)
+
+
+class TransferCompleteView(APIView):
+    """执行转移"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        try:
+            order = services.complete_transfer(pk, user=request.user)
+        except BusinessException as exc:
+            return error_response(message=exc.message, code=exc.code)
+        return success_response(data=TransferOrderSerializer(order).data, message='转移完成')
+
+
+# ==================== 销毁流程 ====================
+
+class DisposalListCreateView(APIView):
+    """销毁计划列表 / 制定销毁计划"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        queryset = DisposalPlan.objects.select_related('goods', 'operator').order_by('-created_at')
+        status = request.query_params.get('status')
+        if status:
+            queryset = queryset.filter(status=status)
+        page = max(int(request.query_params.get('page', 1)), 1)
+        page_size = max(int(request.query_params.get('page_size', 10)), 1)
+        total = queryset.count()
+        records = queryset[(page - 1) * page_size: (page - 1) * page_size + page_size]
+        return success_response(data={
+            'list': DisposalPlanSerializer(records, many=True).data,
+            'total': total, 'page': page, 'page_size': page_size
+        })
+
+    def post(self, request):
+        try:
+            goods = Goods.objects.get(pk=request.data.get('goods'))
+        except (TypeError, ValueError, Goods.DoesNotExist):
+            return error_response(message='物资不存在', code=404)
+        reason = (request.data.get('reason') or '').strip()
+        if not reason:
+            return error_response(message='请填写销毁事由')
+        try:
+            quantity = Decimal(request.data.get('quantity'))
+        except (TypeError, ValueError, InvalidOperation):
+            return error_response(message='销毁数量格式错误')
+        planned_raw = request.data.get('planned_time')
+        planned_time = None
+        if planned_raw:
+            from django.utils.dateparse import parse_datetime
+            planned_time = parse_datetime(str(planned_raw))
+            if planned_time is None:
+                return error_response(message='计划销毁时间格式错误')
+        try:
+            plan = services.create_disposal(
+                user=request.user, goods=goods, quantity=quantity,
+                reason=reason, planned_time=planned_time,
+                remark=request.data.get('remark', ''),
+            )
+        except BusinessException as exc:
+            return error_response(message=exc.message, code=exc.code)
+        return success_response(data=DisposalPlanSerializer(plan).data, message='销毁计划已提交')
+
+
+class DisposalReviewView(APIView):
+    """销毁审批"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        try:
+            plan = services.review_disposal(
+                pk, approver=request.user,
+                approved=bool(request.data.get('approved')),
+                remark=request.data.get('remark', ''),
+            )
+        except BusinessException as exc:
+            return error_response(message=exc.message, code=exc.code)
+        return success_response(data=DisposalPlanSerializer(plan).data)
+
+
+class DisposalDestroyView(APIView):
+    """执行销毁"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        try:
+            plan = services.destroy_disposal(pk, user=request.user)
+        except BusinessException as exc:
+            return error_response(message=exc.message, code=exc.code)
+        return success_response(data=DisposalPlanSerializer(plan).data, message='销毁完成')
+
+
+# ==================== 法律冻结 ====================
+
+def _first_serializer_error(errors):
+    """提取序列化器首个错误文案"""
+    first = list(errors.values())[0]
+    if isinstance(first, dict):
+        return _first_serializer_error(first)
+    if isinstance(first, list):
+        first = first[0]
+        if isinstance(first, dict):
+            return _first_serializer_error(first)
+    return str(first)
+
+
+class FreezeListCreateView(APIView):
+    """冻结记录列表 / 建立法律冻结"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        queryset = LegalFreeze.objects.prefetch_related(
+            'items__goods'
+        ).order_by('-effective_from', '-created_at')
+
+        status = request.query_params.get('status')
+        if status:
+            queryset = queryset.filter(status=status)
+        case_info = request.query_params.get('case_info')
+        if case_info:
+            queryset = queryset.filter(case_info__contains=case_info)
+        freeze_no = request.query_params.get('freeze_no')
+        if freeze_no:
+            queryset = queryset.filter(freeze_no__contains=freeze_no)
+        goods_id = request.query_params.get('goods')
+        if goods_id:
+            queryset = queryset.filter(items__goods_id=goods_id).distinct()
+
+        page = max(int(request.query_params.get('page', 1)), 1)
+        page_size = max(int(request.query_params.get('page_size', 10)), 1)
+        total = queryset.count()
+        records = queryset[(page - 1) * page_size: (page - 1) * page_size + page_size]
+        return success_response(data={
+            'list': LegalFreezeSerializer(records, many=True).data,
+            'total': total, 'page': page, 'page_size': page_size
+        })
+
+    def post(self, request):
+        serializer = LegalFreezeCreateSerializer(data=request.data)
+        if not serializer.is_valid():
+            return error_response(message=_first_serializer_error(serializer.errors))
+        data = serializer.validated_data
+        try:
+            freeze = services.create_freeze(
+                user=request.user,
+                freeze_no=data['freeze_no'],
+                case_info=data['case_info'],
+                authority=data['authority'],
+                legal_doc=data.get('legal_doc', ''),
+                action_type=data.get('action_type') or LegalFreeze.ACTION_FREEZE,
+                effective_from=data['effective_from'],
+                effective_to=data.get('effective_to'),
+                items=[
+                    {
+                        'goods_id': item['goods'],
+                        'operations': item.get('operations') or FreezeItem.ALL_OPERATIONS,
+                        'quantity': item.get('quantity'),
+                    }
+                    for item in data['items']
+                ],
+            )
+        except BusinessException as exc:
+            return error_response(message=exc.message, code=exc.code)
+        return success_response(
+            data=LegalFreezeSerializer(freeze).data, message='冻结已建立'
+        )
+
+
+class FreezeDetailView(APIView):
+    """冻结详情：当前阻断依据 + 完整时间线"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        freeze = LegalFreeze.objects.prefetch_related(
+            'items__goods', 'events__operator', 'events__goods'
+        ).filter(pk=pk).first()
+        if freeze is None:
+            return error_response(message='冻结记录不存在', code=404)
+
+        data = LegalFreezeSerializer(freeze).data
+        # 逐份独立计算当前阻断依据
+        now_basis = []
+        for item in freeze.items.all():
+            if freeze.is_effective and item.restrict_operations:
+                now_basis.append({
+                    'goods_id': item.goods_id,
+                    'goods_name': item.goods.name,
+                    'goods_code': item.goods.code,
+                    'operations': item.operations_list,
+                    'operations_display': [
+                        OPERATION_LABELS.get(op, op) for op in item.operations_list
+                    ],
+                    'quantity': str(item.quantity) if item.quantity is not None else None,
+                })
+        data['current_restrictions'] = now_basis
+        data['timeline'] = FreezeEventSerializer(
+            freeze.events.all().order_by('occurred_at', 'id'), many=True
+        ).data
+        return success_response(data=data)
+
+
+class FreezeLiftView(APIView):
+    """解除一份冻结（不影响其他重叠冻结）"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        serializer = LegalFreezeLiftSerializer(data=request.data)
+        if not serializer.is_valid():
+            return error_response(message=_first_serializer_error(serializer.errors))
+        data = serializer.validated_data
+        try:
+            freeze = services.lift_freeze(
+                pk, user=request.user,
+                lift_doc=data.get('lift_doc', ''),
+                lift_reason=data.get('lift_reason', ''),
+            )
+        except BusinessException as exc:
+            return error_response(message=exc.message, code=exc.code)
+        freeze = LegalFreeze.objects.prefetch_related('items__goods').get(pk=freeze.pk)
+        return success_response(data=LegalFreezeSerializer(freeze).data, message='冻结已解除')
+
+
+class GoodsFreezeStatusView(APIView):
+    """物资冻结状态查询：承办人查看当前阻断依据与该物资的冻结时间线"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        try:
+            goods = Goods.objects.get(pk=pk)
+        except Goods.DoesNotExist:
+            return error_response(message='物资不存在', code=404)
+
+        by_operation = {}
+        all_items = {}
+        for op, label in (
+            (OP_STOCK_OUT, '出库'), (OP_TRANSFER, '转移'), (OP_DESTROY, '销毁')
+        ):
+            items = get_blocking_items([goods.pk], op).get(goods.pk, [])
+            by_operation[op] = {
+                'label': label,
+                'blocked': bool(items),
+                'basis': [
+                    {
+                        'freeze_id': item.freeze_id,
+                        'freeze_no': item.freeze.freeze_no,
+                        'case_info': item.freeze.case_info,
+                        'authority': item.freeze.authority,
+                        'legal_doc': item.freeze.legal_doc,
+                        'action_type': item.freeze.action_type,
+                        'effective_from': item.freeze.effective_from,
+                        'effective_to': item.freeze.effective_to,
+                        'quantity': str(item.quantity) if item.quantity is not None else None,
+                    }
+                    for item in items
+                ],
+            }
+            for item in items:
+                all_items[item.freeze_id] = item.freeze
+
+        # 该物资相关的全部冻结（含已解除、已过期）与事件时间线
+        freeze_records = LegalFreeze.objects.filter(
+            items__goods=goods
+        ).prefetch_related('items').distinct().order_by('-effective_from')
+        freezes_data = []
+        for freeze in freeze_records:
+            item = next(i for i in freeze.items.all() if i.goods_id == goods.pk)
+            freezes_data.append({
+                'freeze_id': freeze.pk,
+                'freeze_no': freeze.freeze_no,
+                'case_info': freeze.case_info,
+                'authority': freeze.authority,
+                'legal_doc': freeze.legal_doc,
+                'status': freeze.status,
+                'status_display': freeze.get_status_display(),
+                'is_effective': freeze.is_effective,
+                'effective_from': freeze.effective_from,
+                'effective_to': freeze.effective_to,
+                'lifted_at': freeze.lifted_at,
+                'lift_reason': freeze.lift_reason,
+                'operations': item.operations_list,
+            })
+
+        events = FreezeEvent.objects.filter(
+            goods=goods
+        ).select_related('freeze', 'operator').order_by('occurred_at', 'id')
+
+        return success_response(data={
+            'goods': GoodsSerializer(goods).data,
+            'is_frozen': bool(all_items),
+            'restrictions': by_operation,
+            'freezes': freezes_data,
+            'timeline': FreezeEventSerializer(events, many=True).data,
         })
